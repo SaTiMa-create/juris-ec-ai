@@ -1,11 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
-import { pipeline } from '@xenova/transformers';
-
-// Variable para guardar el modelo de IA en memoria y no cargarlo cada vez (hace que sea más rápido)
-let generateEmbedding = null;
 
 export default async (req, context) => {
-    // Solo permitimos POST
+    // 1. Configuración básica y CORS
     if (req.method !== "POST") {
         return new Response("Method Not Allowed", { status: 405 });
     }
@@ -13,85 +9,89 @@ export default async (req, context) => {
     try {
         const body = await req.json();
         const userMessage = body.message;
+        
+        console.log("--> Pregunta recibida:", userMessage);
 
-        console.log("--> 1. Recibido mensaje:", userMessage);
+        // 2. FASE 1: Generar Embedding (Vía API de Hugging Face en lugar de local)
+        // Esto elimina la necesidad de sharp y transformers.js
+        const hfToken = process.env.HF_TOKEN;
+        const embeddingResponse = await fetch(
+            "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
+            {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${hfToken}`,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    inputs: userMessage,
+                    options: { wait_for_model: true } // Esperar si el modelo está dormido
+                }),
+            }
+        );
 
-        // --- FASE 1: Convertir la pregunta en números (Embedding) ---
-        if (!generateEmbedding) {
-            console.log("--> Cargando modelo extractor (esto puede tardar la primera vez)...");
-            generateEmbedding = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+        if (!embeddingResponse.ok) {
+            throw new Error(`Error HF: ${embeddingResponse.statusText}`);
         }
 
-        // Generamos el vector de la pregunta del usuario
-        const output = await generateEmbedding(userMessage, { pooling: 'mean', normalize: true });
-        const embedding = Array.from(output.data);
+        const embedding = await embeddingResponse.json();
 
-        // --- FASE 2: Buscar en la Base de Datos (Supabase) ---
-        const supabaseUrl = process.env.SUPABASE_URL;
-        const supabaseKey = process.env.SUPABASE_KEY;
-        const supabase = createClient(supabaseUrl, supabaseKey);
+        // 3. FASE 2: Buscar en Supabase (Igual que antes)
+        const supabase = createClient(
+            process.env.SUPABASE_URL, 
+            process.env.SUPABASE_KEY
+        );
 
-        // Llamamos a la función "match_documents" que creamos con SQL
         const { data: documents, error } = await supabase.rpc('match_documents', {
-            query_embedding: embedding,
-            match_threshold: 0.4, // Similitud mínima (0 a 1)
-            match_count: 3        // Cuántos artículos traer
+            query_embedding: embedding, // El vector que nos dio la API
+            match_threshold: 0.4,
+            match_count: 3
         });
 
-        if (error) console.error("Error buscando en Supabase:", error);
+        if (error) console.error("Error Supabase:", error);
 
-        // Preparamos el texto que encontró la base de datos
+        // Preparamos el contexto
         let contextText = "";
         if (documents && documents.length > 0) {
-            contextText = documents.map(doc => `ARTÍCULO DE LEY: ${doc.content}`).join("\n\n");
-            console.log("--> Encontrados documentos:", documents.length);
+            contextText = documents.map(doc => `ARTÍCULO DE LEY (${doc.metadata.titulo}): ${doc.content}`).join("\n\n");
+            console.log(`--> Encontrados ${documents.length} artículos.`);
         } else {
-            console.log("--> No se encontró información relevante en la base de datos.");
+            console.log("--> No se encontró información relevante.");
             contextText = "No hay artículos específicos en la base de datos para esto.";
         }
 
-        // --- FASE 3: Preguntar a la IA (Groq) con el contexto ---
-        const apiKey = process.env.GROQ_API_KEY;
-        
-        const systemPrompt = `Eres JurisEC, un abogado experto ecuatoriano.
-        
-        INSTRUCCIONES:
-        1. Usa EXCLUSIVAMENTE la siguiente "Información Legal Recuperada" para responder.
-        2. Si la respuesta está en la información, cita textual el artículo.
-        3. Si la información no basta, di: "No tengo esa información en mi base de datos actual".
-        4. Usa formato HTML (<b>negritas</b>, <br> saltos, <ul> listas) para responder.
-
-        --- INFORMACIÓN LEGAL RECUPERADA ---
-        ${contextText}
-        -----------------------------------
-        `;
-
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        // 4. FASE 3: Preguntar a Groq (Igual que antes)
+        const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
             method: "POST",
             headers: {
-                "Authorization": `Bearer ${apiKey}`,
+                "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
                 model: "llama-3.3-70b-versatile",
                 messages: [
-                    { role: "system", content: systemPrompt },
+                    {
+                        role: "system",
+                        content: `Eres JurisEC, abogado experto.
+                        Usa esta INFORMACIÓN RECUPERADA para responder:
+                        ${contextText}
+                        
+                        Si la respuesta está ahí, CITA el artículo. Si no, dilo.`
+                    },
                     { role: "user", content: userMessage }
                 ],
-                temperature: 0.1 // Muy baja creatividad para ser fiel a la ley
+                temperature: 0.1
             })
         });
 
-        const data = await response.json();
+        const groqData = await groqResponse.json();
 
         return new Response(JSON.stringify({ 
-            reply: data.choices[0].message.content 
-        }), {
-            headers: { "Content-Type": "application/json" }
-        });
+            reply: groqData.choices[0].message.content 
+        }), { headers: { "Content-Type": "application/json" } });
 
     } catch (error) {
-        console.error("ERROR CRÍTICO:", error);
+        console.error("ERROR:", error);
         return new Response(JSON.stringify({ error: error.message }), { status: 500 });
     }
 };
