@@ -1,8 +1,6 @@
-{
-  "type": "module",
-  "dependencies": {
-    "sharp": "^0.33.2",
-    "@supabase/supabase-js": "^2.0.0",
-    "@xenova/transformers": "^2.0.0"
-  }
+"dependencies": {
+  "sharp": "^0.33.2",
+  "@img/sharp-linux-x64": "^0.33.2",
+  "@supabase/supabase-js": "^2.0.0",
+  "@xenova/transformers": "^2.0.0"
 }
